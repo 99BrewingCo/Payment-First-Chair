@@ -2,6 +2,10 @@ var crypto = require('crypto');
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 
+admin.initializeApp(functions.config().firebase);
+var db = admin.firestore();
+db.settings({timestampsInSnapshots: true});
+
 //  Square Connect API
 const SquareConnect = require('square-connect');
 
@@ -12,6 +16,23 @@ oauth2.accessToken = functions.config().square.accesstoken;
 let isValidSignature = function ($notificationBody, $notificationSignature, $notificationUrl, $webhookSignatureKey) {
 	let hash = crypto.createHmac('sha1', $webhookSignatureKey).update($notificationUrl + $notificationBody);
 	return (btoa(hash) == $notificationSignature)
+}
+
+let beerRecords = {
+	"Frog Town IPA": {
+		"brewer": "Frogtown",
+		"id": 1,
+		"name": "War On Sobriety"
+	},
+	"Angel City Pilsner": {
+		"brewer": "Angel City",
+		"id": 2,
+		"name": "Pilsner"
+	}
+}
+
+let getBeerRecordFromSquareName = function(name){
+	return beerRecords[name] || {brewer: "Unknown", id: 0, name: "Unknown"};
 }
 
 exports.squareUpdate = functions.https.onRequest((request, response) => {
@@ -60,9 +81,63 @@ exports.squareUpdate = functions.https.onRequest((request, response) => {
 					return squareActionableData;
 				}
 			});
-		}).then(function (data){
-			console.log('finished with processed data', data);
-			response.status(200).send('200 OK');
+		}).then(function (squareData){
+			// Associate New Sale with Game Play
+			return db.runTransaction(function(transaction) {
+				var currentCountRef = db.collection("count").doc("current");
+				// This code may get re-run multiple times if there are conflicts.
+				return transaction.get(currentCountRef).then(function(currentCount) {
+					if (!currentCount.exists) {
+						return;
+					}
+					// Pull First Name Pending Beer
+					if (currentCount.data().namePending.length > 0){
+						let namePending = currentCount.data().namePending;
+						squareData.items.forEach(item => {
+							let beer = namePending.shift();
+
+							// Update Individual Beer Record
+							transaction.update(beer.beer, {
+								"beer": getBeerRecordFromSquareName(item),
+								"events.name": true,
+								"name": {
+									"first": squareData.first,
+									"last": squareData.last,
+									"display": squareData.display,
+								},
+								"payment": {
+									"timestamp": squareData.createdAt,
+									"transaction": squareData.transactionId
+								}
+							});
+
+							// Update Game Display Board
+							transaction.update(db.collection("display").doc(beer.id.toString()), {
+								"display.name": true,
+								"name": {
+									"first": squareData.first,
+									"last": squareData.last,
+									"display": squareData.display,
+								},
+							});
+						});
+
+						// Remove from Database
+						transaction.update(currentCountRef, {
+							namePending: namePending // Update name pending tracker
+						});
+						return true;
+					}else{
+						return false;
+					}
+				});
+			});
+		}).then(function (action){
+			if (action){
+				response.status(200).send('200 OK');
+			} else {
+				response.status(400).send('400 No Pending Beer Tokens to Process');
+			}
 		}).catch(function(error) {
 			console.error(error);
 			response.status(500).send('500 Server Error');
