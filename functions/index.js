@@ -15,7 +15,7 @@ oauth2.accessToken = functions.config().square.accesstoken;
 
 let isValidSignature = function ($notificationBody, $notificationSignature, $notificationUrl, $webhookSignatureKey) {
 	let hash = crypto.createHmac('sha1', $webhookSignatureKey).update($notificationUrl + $notificationBody);
-	return (btoa(hash) == $notificationSignature)
+	return (hash.digest('base64') === $notificationSignature);
 }
 
 let beerRecords = {
@@ -36,113 +36,118 @@ let getBeerRecordFromSquareName = function(name){
 }
 
 exports.squareUpdate = functions.https.onRequest((request, response) => {
-	let squareActionableData = {};
+	if (request.method !== "POST") {
+		response.set('Allow', 'POST');
+		response.status(405).send('405 Method Not Allowed');
+	} else {
+		let squareActionableData = {};
 
-	let validWebhook = isValidSignature(request.body, request.get('X-Square-Signature'), request.protocol + '://' + request.get('host') + request.originalUrl, functions.config().someservice.id);
-	console.log(validWebhook);
+		if (!isValidSignature(request.rawBody, request.get('X-Square-Signature'), functions.config().square.webhooksurl, functions.config().square.webhooksignaturekey)){
+			response.status(401).send('401 Unauthorized');
+		}else {
+			squareActionableData.paymentId = request.body.entity_id;
+			if (request.body.event_type === "PAYMENT_UPDATED"){
+				// Fetch Payment Information
+				var apiInstance = new SquareConnect.V1TransactionsApi();
+				apiInstance.retrievePayment(request.body.location_id, request.body.entity_id).then(paymentData => {
+					squareActionableData.createdAt = paymentData.created_at;
 
-	let squareWebhookEvent = JSON.parse(request.body);
+					// Discover Beers Purchased
+					let items = paymentData.itemizations.map(item => item.name);
+					items = items.filter(items => items !== 'Water Cup');
+					squareActionableData.items = items;
 
-	squareActionableData.paymentId = squareWebhookEvent.entity_id;
-	if (squareWebhookEvent.event_type == "PAYMENT_UPDATED"){
-		// Fetch Payment Information
-		var apiInstance = new SquareConnect.V1TransactionsApi();
-		apiInstance.retrievePayment(squareWebhookEvent.location_id, squareWebhookEvent.entity_id).then(function(paymentData) {
-			squareActionableData.createdAt = paymentData.created_at;
+					// Pull Transaction ID from Payment URL
+					let transactionId = paymentData.payment_url.split('/');
+						transactionId = transactionId[transactionId.length - 1 ];
 
-			// Discover Beers Purchased
-			let items = paymentData.itemizations.map(item => item.name);
-			items = items.filter(items => items !== 'Water Cup');
-			squareActionableData.items = items;
+					squareActionableData.transactionId = transactionId;
 
-			// Pull Transaction ID from Payment URL
-			let transactionId = paymentData.payment_url.split('/');
-				transactionId = transactionId[transactionId.length - 1 ];
+					var apiInstance = new SquareConnect.TransactionsApi();
+					return apiInstance.retrieveTransaction(request.body.location_id, transactionId).then(transactionData => {
+						// Pull Customer IDs from Transactions
+						let customerIds = transactionData.transaction.tenders.map(tender => (tender.hasOwnProperty('customer_id'))? tender.customer_id : null);
+						customerIds = customerIds.filter(customerId => customerId !== null);
 
-			squareActionableData.transactionId = transactionId;
+						if (customerIds.length > 0){
+							var apiInstance = new SquareConnect.CustomersApi();
+							return apiInstance.retrieveCustomer(customerIds[0]).then(customerData => {
+								// Pull Customer Name from Customers
+								squareActionableData.first = customerData.customer.given_name;
+								squareActionableData.last = customerData.customer.family_name;
+								squareActionableData.display = `${customerData.customer.given_name} ${customerData.customer.family_name.charAt(0)}.`;
 
-			var apiInstance = new SquareConnect.TransactionsApi();
-			return apiInstance.retrieveTransaction(squareWebhookEvent.location_id, transactionId).then(function(transactionData) {
-				// Pull Customer IDs from Transactions
-				let customerIds = transactionData.transaction.tenders.map(tender => (tender.hasOwnProperty('customer_id'))? tender.customer_id : null);
-				customerIds = customerIds.filter(customerId => customerId !== null);
-
-				if (customerIds.length > 0){
-					var apiInstance = new SquareConnect.CustomersApi();
-					return apiInstance.retrieveCustomer(customerIds[0]).then(function(customerData) {
-						// Pull Customer Name from Customers
-						squareActionableData.first = customerData.customer.given_name;
-						squareActionableData.last = customerData.customer.family_name;
-						squareActionableData.display = `${customerData.customer.given_name} ${customerData.customer.family_name.charAt(0)}.`;
-
-						return squareActionableData;
+								return squareActionableData;
+							});
+						} else {
+							return squareActionableData;
+						}
 					});
-				} else {
-					return squareActionableData;
-				}
-			});
-		}).then(function (squareData){
-			// Associate New Sale with Game Play
-			return db.runTransaction(function(transaction) {
-				var currentCountRef = db.collection("count").doc("current");
-				// This code may get re-run multiple times if there are conflicts.
-				return transaction.get(currentCountRef).then(function(currentCount) {
-					if (!currentCount.exists) {
-						return;
-					}
-					// Pull First Name Pending Beer
-					if (currentCount.data().namePending.length > 0){
-						let namePending = currentCount.data().namePending;
-						squareData.items.forEach(item => {
-							let beer = namePending.shift();
+				}).then(squareData => {
+					// Associate New Sale with Game Play
+					return db.runTransaction(transaction => {
+						var currentCountRef = db.collection("count").doc("current");
+						// This code may get re-run multiple times if there are conflicts.
+						return transaction.get(currentCountRef).then(currentCount => {
+							if (!currentCount.exists) {
+								return;
+							}
+							// Pull First Name Pending Beer
+							if (currentCount.data().namePending.length > 0){
+								let namePending = currentCount.data().namePending;
+								squareData.items.forEach(item => {
+									let beer = namePending.shift();
 
-							// Update Individual Beer Record
-							transaction.update(beer.beer, {
-								"beer": getBeerRecordFromSquareName(item),
-								"events.name": true,
-								"name": {
-									"first": squareData.first,
-									"last": squareData.last,
-									"display": squareData.display,
-								},
-								"payment": {
-									"timestamp": squareData.createdAt,
-									"transaction": squareData.transactionId
-								}
-							});
+									// Update Individual Beer Record
+									transaction.update(beer.beer, {
+										"beer": getBeerRecordFromSquareName(item),
+										"events.name": true,
+										"name": {
+											"first": squareData.first,
+											"last": squareData.last,
+											"display": squareData.display,
+										},
+										"payment": {
+											"timestamp": squareData.createdAt,
+											"transaction": squareData.transactionId
+										}
+									});
 
-							// Update Game Display Board
-							transaction.update(db.collection("display").doc(beer.id.toString()), {
-								"display.name": true,
-								"name": {
-									"first": squareData.first,
-									"last": squareData.last,
-									"display": squareData.display,
-								},
-							});
+									// Update Game Display Board
+									transaction.update(db.collection("display").doc(beer.id.toString()), {
+										"display.name": true,
+										"name": {
+											"first": squareData.first,
+											"last": squareData.last,
+											"display": squareData.display,
+										},
+									});
+								});
+
+								// Remove from Database
+								transaction.update(currentCountRef, {
+									namePending: namePending // Update name pending tracker
+								});
+								return true;
+							}else{
+								return false;
+							}
 						});
-
-						// Remove from Database
-						transaction.update(currentCountRef, {
-							namePending: namePending // Update name pending tracker
-						});
-						return true;
-					}else{
-						return false;
+					});
+				}).then(action => {
+					if (action){
+						response.status(200).send('200 OK');
+					} else {
+						response.status(400).send('400 No Pending Beer Tokens to Process');
 					}
+					return;
+				}).catch(error => {
+					console.error(error);
+					response.status(500).send('500 Server Error');
 				});
-			});
-		}).then(function (action){
-			if (action){
-				response.status(200).send('200 OK');
 			} else {
-				response.status(400).send('400 No Pending Beer Tokens to Process');
+				response.status(200).send('No Processing Required.');
 			}
-		}).catch(function(error) {
-			console.error(error);
-			response.status(500).send('500 Server Error');
-		});
-	}else {
-		response.status(200).send('No Processing Required.');
+		}
 	}
 });
