@@ -90,7 +90,7 @@ exports.squareUpdate = functions.https.onRequest((request, response) => {
 						// This code may get re-run multiple times if there are conflicts.
 						return transaction.get(currentCountRef).then(currentCount => {
 							if (!currentCount.exists) {
-								return;
+								return false;
 							}
 							// Pull First Name Pending Beer
 							if (currentCount.data().namePending.length > 0){
@@ -128,8 +128,9 @@ exports.squareUpdate = functions.https.onRequest((request, response) => {
 								transaction.update(currentCountRef, {
 									namePending: namePending // Update name pending tracker
 								});
+
 								return true;
-							}else{
+							} else {
 								return false;
 							}
 						});
@@ -140,7 +141,7 @@ exports.squareUpdate = functions.https.onRequest((request, response) => {
 					} else {
 						response.status(400).send('400 No Pending Beer Tokens to Process');
 					}
-					return;
+					return true;
 				}).catch(error => {
 					console.error(error);
 					response.status(500).send('500 Server Error');
